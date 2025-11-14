@@ -22,14 +22,11 @@ protocol Endpoint {
 
 extension Endpoint {
     func getUrlRequest() throws -> URLRequest {
-        guard var components = URLComponents(url: baseApi.appending(path: path), resolvingAgainstBaseURL: false),
+        guard let components = URLComponents(url: baseApi.appending(path: path), resolvingAgainstBaseURL: false),
               let url = components.url else {
             throw NetworkError.invalidUrl
         }
         
-        guard let url = components.url else {
-            throw NetworkError.invalidUrl
-        }
         var request = URLRequest(url: url, cachePolicy: cachePolicy)
         request.httpMethod = httpMethod.rawValue
         return request
