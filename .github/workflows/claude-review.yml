@@ -56,11 +56,12 @@ jobs:
             -d "$(jq -n \
               --arg patch "$PATCH" \
               '{
-                max_tokens: 1000,
-                messages: [
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 1000,
+                "messages": [
                   {
-                    role: "user",
-                    content: "You are a senior engineer reviewing a pull request. Identify bugs, edge cases, security issues, and improvements.\n\nReview this diff:\n\n\($patch)"
+                    "role": "user",
+                    "content": "You are a senior engineer reviewing a pull request. Identify bugs, edge cases, security issues, and improvements.\n\nReview this diff:\n\n\($patch)"
                   }
                 ]
               }')")
