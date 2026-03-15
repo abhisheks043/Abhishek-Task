@@ -1,0 +1,72 @@
+name: Cursor PR Review
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  cursor-review:
+    # Only trigger if exact match "cursor review" (case-insensitive)
+    if: contains(github.event.comment.body, 'cursor review')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Get PR details
+        id: get-pr
+        run: |
+          PR_URL=$(jq -r '.issue.pull_request.url' <<< "${{ toJson(github.event) }}")
+          echo "pr_url=$PR_URL" >> $GITHUB_OUTPUT
+
+      - name: Get PR diff
+        id: get-diff
+        run: |
+          DIFF=$(curl -s \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3.diff" \
+            "${{ steps.get-pr.outputs.pr_url }}")
+          # Store diff for next step
+          echo "diff<<EOF" >> $GITHUB_OUTPUT
+          echo "$DIFF" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Load project context
+        id: load-context
+        run: |
+          if [ -f ".cursor-context" ]; then
+            CONTEXT=$(cat .cursor-context)
+          else
+            CONTEXT="No context provided."
+          fi
+          echo "context<<EOF" >> $GITHUB_OUTPUT
+          echo "$CONTEXT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Send to Cursor API
+        id: send-cursor
+        run: |
+          RESPONSE=$(curl -s \
+            -X POST "https://api.cursor.sh/review" \
+            -H "Authorization: Bearer ${{ secrets.CURSOR_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+                  --arg diff "${{ steps.get-diff.outputs.diff }}" \
+                  --arg ctx "${{ steps.load-context.outputs.context }}" \
+                  '{diff: $diff, context: $ctx}')")
+          echo "review<<EOF" >> $GITHUB_OUTPUT
+          echo "$RESPONSE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Post review to PR
+        run: |
+          ISSUE_URL="${{ github.event.issue.url }}"
+          REVIEW_TEXT="${{ steps.send-cursor.outputs.review }}"
+          curl -s \
+            -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg body "$REVIEW_TEXT" '{"body":$body}')" \
+            "$ISSUE_URL/comments"
