@@ -111,6 +111,7 @@ jobs:
                   '{
                     "model":"claude-sonnet-4-6",
                     "max_tokens":800,
+                    "system":"You are a strict JSON API. Return valid JSON only. Do not use markdown. Do not explain anything.",
                     "messages":[
                       {
                         "role":"user",
@@ -132,7 +133,13 @@ jobs:
 
               echo "$TEXT" > raw.txt
 
-              sed -n '/{/,/}/p' raw.txt > review.json
+              # remove markdown code fences if Claude added them
+              sed 's/^```json//g; s/^```//g' raw.txt > cleaned.txt
+              
+              # extract full JSON object safely
+              JSON=$(cat cleaned.txt | awk 'BEGIN{p=0} /\{/{p=1} p{print} /\}/{exit}')
+              
+              echo "$JSON" > review.json
 
               if jq empty review.json 2>/dev/null; then
                 echo "Valid JSON received"
