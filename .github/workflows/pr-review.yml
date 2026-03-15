@@ -21,91 +21,93 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Get PR number
+      - name: Extract PR info
         id: pr
         run: |
           PR_NUMBER=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
-          echo "PR_NUMBER=$PR_NUMBER"
           echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
 
-      - name: Fetch PR diff
-        id: diff
+      - name: Fetch PR files
         run: |
-          DIFF=$(curl -s \
+          curl -s \
           -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-          -H "Accept: application/vnd.github.v3.diff" \
-          https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr_number }})
+          https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr_number }}/files \
+          > files.json
 
-          echo "---- DIFF SAMPLE ----"
-          echo "$DIFF" | head -n 40
-          echo "---------------------"
+          echo "Changed files:"
+          cat files.json | jq '.[].filename'
 
-          DIFF=$(echo "$DIFF" | head -c 12000)
+      - name: Prepare patches
+        run: |
+          jq -c '.[] | {file: .filename, patch: .patch}' files.json > patches.json
 
-          echo "diff<<EOF" >> $GITHUB_OUTPUT
-          echo "$DIFF" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Call OpenAI
+      - name: Call OpenAI reviewer
         id: ai
         run: |
 
-          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
-            echo "❌ OPENAI_API_KEY secret missing"
-            echo "review=OPENAI_API_KEY secret missing" >> $GITHUB_OUTPUT
-            exit 0
-          fi
+          PATCH=$(cat patches.json | head -c 12000)
 
           RESPONSE=$(curl https://api.openai.com/v1/chat/completions \
           -s \
           -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
           -H "Content-Type: application/json" \
           -d "$(jq -n \
-            --arg diff "${{ steps.diff.outputs.diff }}" \
+            --arg patch "$PATCH" \
             '{
               model: "gpt-4o-mini",
               messages: [
                 {
                   role: "system",
-                  content: "You are a senior engineer reviewing a pull request."
+                  content: "You are a senior software engineer performing a pull request review."
                 },
                 {
                   role: "user",
-                  content: "Review the following git diff and provide feedback grouped by file:\n\n\($diff)"
+                  content: "Analyze these git patches and return review comments in JSON format with fields: file, line, comment.\n\n\($patch)"
                 }
               ]
             }')")
 
-          echo "----- OPENAI RESPONSE -----"
+          echo "OpenAI response:"
           echo "$RESPONSE"
-          echo "---------------------------"
 
-          ERROR=$(echo "$RESPONSE" | jq -r '.error.message // empty')
+          COMMENTS=$(echo "$RESPONSE" | jq '.choices[0].message.content')
 
-          if [ ! -z "$ERROR" ]; then
-            echo "OpenAI error: $ERROR"
-            REVIEW="❌ OpenAI API error:\n$ERROR"
+          if [ "$COMMENTS" = "null" ]; then
+            echo "No comments generated."
+            echo "comments=[]" >> $GITHUB_OUTPUT
           else
-            REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+            echo "comments=$COMMENTS" >> $GITHUB_OUTPUT
           fi
 
-          if [ -z "$REVIEW" ]; then
-            REVIEW="⚠️ AI returned empty response. Check workflow logs."
-          fi
-
-          echo "review<<EOF" >> $GITHUB_OUTPUT
-          echo "$REVIEW" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Post review
+      - name: Post inline review comments
         run: |
-          COMMENT_URL="https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr_number }}/comments"
 
-          BODY="${{ steps.ai.outputs.review }}"
+          COMMENTS='${{ steps.ai.outputs.comments }}'
 
-          curl -s \
-          -X POST \
-          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-          -H "Content-Type: application/json" \
-          -d "$(jq -n --arg body "$BODY" '{body:$body}')" \
-          "$COMMENT_URL"
+          if [ "$COMMENTS" = "[]" ]; then
+            echo "No AI comments to post"
+            exit 0
+          fi
+
+          echo "$COMMENTS" | jq -c '.[]' | while read comment; do
+
+            FILE=$(echo "$comment" | jq -r '.file')
+            LINE=$(echo "$comment" | jq -r '.line')
+            BODY=$(echo "$comment" | jq -r '.comment')
+
+            curl -s -X POST \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n \
+                --arg body "$BODY" \
+                --arg path "$FILE" \
+                --argjson line "$LINE" \
+                '{
+                  body: $body,
+                  path: $path,
+                  line: $line,
+                  side: "RIGHT"
+                }')" \
+              https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr_number }}/comments
+
+          done
