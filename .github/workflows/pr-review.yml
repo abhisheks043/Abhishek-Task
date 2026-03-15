@@ -25,45 +25,73 @@ jobs:
         id: pr
         run: |
           PR_NUMBER=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
+          echo "PR_NUMBER=$PR_NUMBER"
           echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
 
-      - name: Fetch changed files
+      - name: Fetch PR diff
+        id: diff
         run: |
-          curl -s \
+          DIFF=$(curl -s \
           -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-          https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr_number }}/files \
-          > files.json
+          -H "Accept: application/vnd.github.v3.diff" \
+          https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr_number }})
 
-      - name: Extract patches
-        run: |
-          jq -r '.[] | "FILE: \(.filename)\n\(.patch)\n---"' files.json > patches.txt
+          echo "---- DIFF SAMPLE ----"
+          echo "$DIFF" | head -n 40
+          echo "---------------------"
 
-      - name: Send to OpenAI
+          DIFF=$(echo "$DIFF" | head -c 12000)
+
+          echo "diff<<EOF" >> $GITHUB_OUTPUT
+          echo "$DIFF" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Call OpenAI
         id: ai
         run: |
-          PATCH=$(cat patches.txt | head -c 12000)
+
+          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "❌ OPENAI_API_KEY secret missing"
+            echo "review=OPENAI_API_KEY secret missing" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
           RESPONSE=$(curl https://api.openai.com/v1/chat/completions \
           -s \
           -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
           -H "Content-Type: application/json" \
           -d "$(jq -n \
-          --arg diff "$PATCH" \
-          '{
-            model: "gpt-4o-mini",
-            messages: [
-              {
-                role: "system",
-                content: "You are a senior software engineer performing a pull request review."
-              },
-              {
-                role: "user",
-                content: "Review these file patches and provide structured feedback grouped by file:\n\n\($diff)"
-              }
-            ]
-          }')")
+            --arg diff "${{ steps.diff.outputs.diff }}" \
+            '{
+              model: "gpt-4o-mini",
+              messages: [
+                {
+                  role: "system",
+                  content: "You are a senior engineer reviewing a pull request."
+                },
+                {
+                  role: "user",
+                  content: "Review the following git diff and provide feedback grouped by file:\n\n\($diff)"
+                }
+              ]
+            }')")
 
-          REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content')
+          echo "----- OPENAI RESPONSE -----"
+          echo "$RESPONSE"
+          echo "---------------------------"
+
+          ERROR=$(echo "$RESPONSE" | jq -r '.error.message // empty')
+
+          if [ ! -z "$ERROR" ]; then
+            echo "OpenAI error: $ERROR"
+            REVIEW="❌ OpenAI API error:\n$ERROR"
+          else
+            REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+          fi
+
+          if [ -z "$REVIEW" ]; then
+            REVIEW="⚠️ AI returned empty response. Check workflow logs."
+          fi
 
           echo "review<<EOF" >> $GITHUB_OUTPUT
           echo "$REVIEW" >> $GITHUB_OUTPUT
@@ -71,9 +99,13 @@ jobs:
 
       - name: Post review
         run: |
+          COMMENT_URL="https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr_number }}/comments"
+
+          BODY="${{ steps.ai.outputs.review }}"
+
           curl -s \
           -X POST \
           -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
           -H "Content-Type: application/json" \
-          -d "$(jq -n --arg body "${{ steps.ai.outputs.review }}" '{body:$body}')" \
-          https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr_number }}/comments
+          -d "$(jq -n --arg body "$BODY" '{body:$body}')" \
+          "$COMMENT_URL"
