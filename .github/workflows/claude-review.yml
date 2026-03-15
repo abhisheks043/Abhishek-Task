@@ -86,4 +86,3 @@ steps:
         -H "Content-Type: application/json" \
         -d "$(jq -n --arg body "$BODY" '{body:$body}')" \
         https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr }}/comments
-```
