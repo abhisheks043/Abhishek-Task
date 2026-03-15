@@ -13,7 +13,9 @@ struct Holding: Codable {
     let ltp: Double
     let avgPrice: Double
     let close: Double
-    
+
+    ADFASDas
+    var sdhfdsu: 
     
     var currentValue: Double {
         return Double(quantity) * ltp
