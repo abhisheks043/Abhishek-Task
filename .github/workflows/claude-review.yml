@@ -1,73 +1,90 @@
 name: Claude PR Review
 
 on:
-  issue_comment:
-    types: [created]
+issue_comment:
+types: [created]
 
 permissions:
-  contents: read
-  pull-requests: write
-  issues: write
+contents: read
+pull-requests: write
+issues: write
 
 jobs:
-  review:
-    if: >
-      github.event.issue.pull_request &&
-      contains(toLower(github.event.comment.body), '/review')
+review:
+if: >
+github.event.issue.pull_request &&
+(
+contains(github.event.comment.body, '/review') ||
+contains(github.event.comment.body, '/REVIEW')
+) &&
+github.event.comment.user.type != 'Bot'
 
-    runs-on: ubuntu-latest
+```
+runs-on: ubuntu-latest
 
-    steps:
+steps:
 
-      - name: Extract PR number
-        id: pr
-        run: |
-          PR=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
-          echo "pr=$PR" >> $GITHUB_OUTPUT
+  - name: Extract PR number
+    id: pr
+    run: |
+      PR=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
+      echo "pr=$PR" >> $GITHUB_OUTPUT
 
-      - name: Fetch PR files
-        run: |
-          curl -s \
-          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-          https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr }}/files \
-          > files.json
+  - name: Fetch PR files
+    run: |
+      curl -s \
+      -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+      https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr }}/files \
+      > files.json
 
-      - name: Run Claude review
-        id: review
-        run: |
+  - name: Build patch summary
+    run: |
+      jq -r '.[] | "\(.filename)\n\(.patch)\n---"' files.json > patch.txt
 
-          PATCH=$(jq -r '.[] | .patch // empty' files.json | head -c 15000)
+  - name: Request Claude review
+    id: review
+    run: |
 
-          RESPONSE=$(curl https://api.anthropic.com/v1/messages \
-            -s \
-            -H "x-api-key: ${{ secrets.CLAUDE_API_KEY }}" \
-            -H "anthropic-version: 2023-06-01" \
-            -H "content-type: application/json" \
-            -d "$(jq -n \
-              --arg patch "$PATCH" \
-              '{
-                model: "claude-3-7-sonnet-latest",
-                max_tokens: 1000,
-                messages: [
-                  {
-                    role: "user",
-                    content: "Review this pull request diff:\n\n\($patch)"
-                  }
-                ]
-              }')")
+      PATCH=$(cat patch.txt | head -c 15000)
 
-          RESULT=$(echo "$RESPONSE" | jq -r '.content[0].text')
+      RESPONSE=$(curl https://api.anthropic.com/v1/messages \
+        -s \
+        -H "x-api-key: ${{ secrets.CLAUDE_API_KEY }}" \
+        -H "anthropic-version: 2023-06-01" \
+        -H "content-type: application/json" \
+        -d "$(jq -n \
+          --arg patch "$PATCH" \
+          '{
+            model: "claude-3-7-sonnet-latest",
+            max_tokens: 1200,
+            system: "You are a senior staff engineer reviewing pull requests. Identify bugs, edge cases, performance issues, and security problems. Respond in clear markdown grouped by file.",
+            messages: [
+              {
+                role: "user",
+                content: "Review this git diff:\n\n\($patch)"
+              }
+            ]
+          }')")
 
-          echo "result<<EOF" >> $GITHUB_OUTPUT
-          echo "$RESULT" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+      echo "$RESPONSE"
 
-      - name: Post PR comment
-        run: |
-          BODY="${{ steps.review.outputs.result }}"
+      RESULT=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
 
-          curl -X POST \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n --arg body "$BODY" '{body:$body}')" \
-            https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr }}/comments
+      if [ -z "$RESULT" ]; then
+        RESULT="⚠️ Claude returned an empty review."
+      fi
+
+      echo "result<<EOF" >> $GITHUB_OUTPUT
+      echo "$RESULT" >> $GITHUB_OUTPUT
+      echo "EOF" >> $GITHUB_OUTPUT
+
+  - name: Post PR comment
+    run: |
+      BODY="${{ steps.review.outputs.result }}"
+
+      curl -s -X POST \
+        -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+        -H "Content-Type: application/json" \
+        -d "$(jq -n --arg body "$BODY" '{body:$body}')" \
+        https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr }}/comments
+```
