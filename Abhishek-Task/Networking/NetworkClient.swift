@@ -30,8 +30,7 @@ final class NetworkClient: NetworkClientProtocol {
         }
         
         let request = try request.getUrlRequest()
-        do {
-            // get response and data from request
+        // get response and data from request
             let (data, response) = try await session.data(for: request)
             
             // check for valid response
@@ -42,14 +41,12 @@ final class NetworkClient: NetworkClientProtocol {
             // check for valid status code
             guard (200...299).contains(response.statusCode) else {
                 throw NetworkError.server(statusCode: response.statusCode, data: data)
-            }
-            
             // decode data
             return try decoder.decode(T.self, from: data)
         } catch let error as DecodingError {
             throw NetworkError.decodingError(error)
         } catch {
-            throw NetworkError.transport(error)
         }
+                    throw NetworkError.transport(error)
     }
 }
