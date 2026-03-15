@@ -153,8 +153,9 @@ jobs:
             done
 
             if ! jq empty review.json 2>/dev/null; then
-              echo "Skipping file due to invalid Claude response"
-              continue
+              echo "Claude returned invalid JSON. Treating as no comments."
+            
+              echo '{"comments":[]}' > review.json
             fi
 
             COMMENTS=$(jq '.comments | length' review.json)
