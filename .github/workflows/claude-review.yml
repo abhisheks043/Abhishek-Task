@@ -2,8 +2,7 @@ name: Claude PR Review
 
 on:
   issue_comment:
-    types:
-      - created
+    types: [created]
 
 permissions:
   contents: read
@@ -12,11 +11,15 @@ permissions:
 
 jobs:
   review:
+    if: >
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/review') &&
+      github.event.comment.user.type != 'Bot'
+
     runs-on: ubuntu-latest
 
-    if: github.event.issue.pull_request && contains(github.event.comment.body, '/review')
-
     steps:
+
       - name: Extract PR number
         id: pr
         run: |
@@ -24,102 +27,168 @@ jobs:
           echo "PR number: $PR"
           echo "pr=$PR" >> $GITHUB_OUTPUT
 
-      - name: Get PR head SHA
+      - name: Fetch PR metadata
         id: sha
         run: |
+          set -e
+
           curl -s \
           -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
           https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr }} \
           > pr.json
 
           SHA=$(jq -r '.head.sha' pr.json)
+
+          if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+            echo "Failed to fetch PR SHA"
+            exit 1
+          fi
+
           echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "PR head SHA: $SHA"
 
       - name: Fetch PR files
         run: |
+          set -e
+
           curl -s \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr }}/files \
-            > files.json
+          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+          https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr }}/files \
+          > files.json
 
-          echo "Fetched PR files:"
-          cat files.json
+          COUNT=$(jq length files.json)
 
-      - name: Build patch summary
-        run: |
-          jq -r '.[] | select(.patch != null) | "\(.filename)\n\(.patch)\n---"' files.json > patch.txt
+          echo "Files changed: $COUNT"
 
-          echo "Patch preview:"
-          head -n 50 patch.txt
-
-      - name: Call Claude API
-        id: review
-        run: |
-          PATCH=$(head -c 12000 patch.txt)
-
-          echo "Sending patch to Claude..."
-
-          RESPONSE=$(curl https://api.anthropic.com/v1/messages \
-            -s \
-            -H "x-api-key: ${{ secrets.CLAUDE_API_KEY }}" \
-            -H "anthropic-version: 2023-06-01" \
-            -H "content-type: application/json" \
-            -d "$(jq -n \
-              --arg patch "$PATCH" \
-              '{
-                "model": "claude-sonnet-4-6",
-                "max_tokens": 1000,
-                "messages": [
-                  {
-                    "role": "user",
-                    "content": "You are a senior engineer reviewing a pull request.\n\nAnalyze the git diff and return JSON ONLY in this format:\n\n{\n \"comments\": [\n   {\n     \"file\": \"path/to/file\",\n     \"line\": number,\n     \"comment\": \"review comment\"\n   }\n ]\n}\n\nDiff:\n\n\($patch)"
-                  }
-                ]
-              }')")
-
-          echo "Claude API raw response:"
-          echo "$RESPONSE" > claude_raw.json
-          echo "$RESPONSE" | jq -r '.content[0].text' > review.json
-
-          if [ -z "$RESULT" ]; then
-            RESULT="⚠️ Claude returned no review. Check workflow logs for API response."
-          fi
-
-          echo "result<<EOF" >> $GITHUB_OUTPUT
-          echo "$RESULT" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Post inline comments
-        run: |
-
-          COMMENTS=$(jq '.comments | length' review.json)
-
-          if [ "$COMMENTS" = "null" ]; then
-            echo "No comments returned"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No files to review"
             exit 0
           fi
 
-          for ((i=0;i<COMMENTS;i++)); do
+      - name: Review each file with Claude
+        run: |
 
-            FILE=$(jq -r ".comments[$i].file" review.json)
-            LINE=$(jq -r ".comments[$i].line" review.json)
-            TEXT=$(jq -r ".comments[$i].comment" review.json)
+          FILE_COUNT=$(jq length files.json)
 
-            echo "Posting comment on $FILE:$LINE"
+          for ((i=0;i<FILE_COUNT;i++)); do
 
-            curl -s -X POST \
-              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Accept: application/vnd.github+json" \
-              https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr }}/comments \
-              -d "$(jq -n \
-                --arg body "$TEXT" \
-                --arg path "$FILE" \
-                --argjson line "$LINE" \
-                --arg commit "${{ steps.sha.outputs.sha }}" \
-                '{
-                  body:$body,
-                  path:$path,
-                  line:$line,
-                  side:"RIGHT",
-                  commit_id:$commit
-                }')"
+            FILE=$(jq -r ".[$i].filename" files.json)
+            PATCH=$(jq -r ".[$i].patch // empty" files.json)
+
+            echo ""
+            echo "--------------------------------"
+            echo "Reviewing file: $FILE"
+            echo "--------------------------------"
+
+            if [ -z "$PATCH" ]; then
+              echo "Skipping (no patch)"
+              continue
+            fi
+
+            PATCH_LENGTH=${#PATCH}
+
+            if [ "$PATCH_LENGTH" -gt 15000 ]; then
+              echo "Skipping large patch ($PATCH_LENGTH chars)"
+              continue
+            fi
+
+            ### Claude retry logic
+            MAX_RETRIES=3
+            ATTEMPT=1
+
+            while [ $ATTEMPT -le $MAX_RETRIES ]; do
+
+              echo "Claude attempt $ATTEMPT"
+
+              RESPONSE=$(curl https://api.anthropic.com/v1/messages \
+                -s \
+                -H "x-api-key: ${{ secrets.CLAUDE_API_KEY }}" \
+                -H "anthropic-version: 2023-06-01" \
+                -H "content-type: application/json" \
+                -d "$(jq -n \
+                  --arg file "$FILE" \
+                  --arg patch "$PATCH" \
+                  '{
+                    "model":"claude-sonnet-4-6",
+                    "max_tokens":800,
+                    "messages":[
+                      {
+                        "role":"user",
+                        "content":"You are a senior engineer reviewing a pull request.\n\nReturn ONLY valid JSON.\nDo not include markdown.\n\nFormat:\n{\n \"comments\": [\n  {\n   \"file\": \"file_path\",\n   \"line\": number,\n   \"comment\": \"review comment\"\n  }\n ]\n}\n\nFile:\n\($file)\n\nPatch:\n\($patch)"
+                      }
+                    ]
+                  }')")
+
+              echo "$RESPONSE" > claude_raw.json
+
+              TEXT=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+
+              if [ -z "$TEXT" ]; then
+                echo "Claude returned empty response"
+                ATTEMPT=$((ATTEMPT+1))
+                sleep 2
+                continue
+              fi
+
+              echo "$TEXT" > raw.txt
+
+              sed -n '/{/,/}/p' raw.txt > review.json
+
+              if jq empty review.json 2>/dev/null; then
+                echo "Valid JSON received"
+                break
+              fi
+
+              echo "Invalid JSON from Claude"
+              ATTEMPT=$((ATTEMPT+1))
+              sleep 2
+
+            done
+
+            if ! jq empty review.json 2>/dev/null; then
+              echo "Skipping file due to invalid Claude response"
+              continue
+            fi
+
+            COMMENTS=$(jq '.comments | length' review.json)
+
+            if [ "$COMMENTS" -eq 0 ]; then
+              echo "No comments from Claude"
+              continue
+            fi
+
+            for ((j=0;j<COMMENTS;j++)); do
+
+              COMMENT_FILE=$(jq -r ".comments[$j].file" review.json)
+              LINE=$(jq -r ".comments[$j].line" review.json)
+              TEXT=$(jq -r ".comments[$j].comment" review.json)
+
+              if [ "$LINE" = "null" ] || [ -z "$LINE" ]; then
+                echo "Skipping invalid line"
+                continue
+              fi
+
+              echo "Posting comment on $COMMENT_FILE:$LINE"
+
+              curl -s -X POST \
+                -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Accept: application/vnd.github+json" \
+                https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr }}/comments \
+                -d "$(jq -n \
+                  --arg body "$TEXT" \
+                  --arg path "$COMMENT_FILE" \
+                  --argjson line "$LINE" \
+                  --arg commit "${{ steps.sha.outputs.sha }}" \
+                  '{
+                    body:$body,
+                    path:$path,
+                    line:$line,
+                    side:"RIGHT",
+                    commit_id:$commit
+                  }')"
+
+              sleep 0.5
+
+            done
+
+          done
