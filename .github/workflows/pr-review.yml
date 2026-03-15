@@ -13,34 +13,39 @@ jobs:
   review:
     if: >
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, '@review') &&
-      github.event.comment.user.type != 'Bot'
+      contains(github.event.comment.body, '@review')
 
     runs-on: ubuntu-latest
 
     steps:
-      - name: Get PR number
+      - name: Extract PR number
         id: pr
         run: |
           PR=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
+          echo "PR number: $PR"
           echo "pr=$PR" >> $GITHUB_OUTPUT
 
-      - name: Fetch changed files
+      - name: Fetch PR files
         run: |
           curl -s \
           -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
           https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr }}/files \
           > files.json
 
+          echo "FILES:"
+          cat files.json
+
       - name: Build patch summary
         run: |
-          jq -r '.[] | "\(.filename)\n\(.patch)\n---"' files.json | head -c 12000 > patch.txt
+          jq -r '.[] | "\(.filename)\n\(.patch)\n---"' files.json > patch.txt
+          echo "PATCH:"
+          cat patch.txt
 
-      - name: Ask OpenAI for review
+      - name: Ask OpenAI
         id: ai
         run: |
 
-          PATCH=$(cat patch.txt)
+          PATCH=$(cat patch.txt | head -c 8000)
 
           RESPONSE=$(curl https://api.openai.com/v1/chat/completions \
             -s \
@@ -51,24 +56,15 @@ jobs:
               '{
                 model: "gpt-4o-mini",
                 messages: [
-                  {
-                    role: "system",
-                    content: "You are a senior software engineer performing code reviews."
-                  },
-                  {
-                    role: "user",
-                    content: "Review the following git diff. Provide concise improvement suggestions grouped by file. Always return useful feedback even if the code is correct.\n\n\($patch)"
-                  }
+                  {role:"system",content:"You are a strict code reviewer."},
+                  {role:"user",content:"Review this diff and give feedback:\n\n\($patch)"}
                 ]
               }')")
 
+          echo "OPENAI RESPONSE:"
           echo "$RESPONSE"
 
-          REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content')
-
-          if [ -z "$REVIEW" ] || [ "$REVIEW" = "null" ]; then
-            REVIEW="AI review failed. Check workflow logs."
-          fi
+          REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "AI returned empty response."')
 
           echo "review<<EOF" >> $GITHUB_OUTPUT
           echo "$REVIEW" >> $GITHUB_OUTPUT
@@ -76,8 +72,13 @@ jobs:
 
       - name: Post PR comment
         run: |
-          curl -s -X POST \
+          BODY="${{ steps.ai.outputs.review }}"
+
+          echo "POSTING COMMENT:"
+          echo "$BODY"
+
+          curl -v -X POST \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg body "${{ steps.ai.outputs.review }}" '{body:$body}')" \
+            -d "$(jq -n --arg body "$BODY" '{body:$body}')" \
             https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr }}/comments
