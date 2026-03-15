@@ -69,7 +69,7 @@ jobs:
           echo "Claude API raw response:"
           echo "$RESPONSE"
 
-          RESULT=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
+          RESULT=$(echo "$RESPONSE" | jq -r '.content[0].text')
 
           if [ -z "$RESULT" ]; then
             RESULT="⚠️ Claude returned no review. Check workflow logs for API response."
@@ -79,14 +79,10 @@ jobs:
           echo "$RESULT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Post comment to PR
+      - name: Post PR comment
         run: |
-          BODY="${{ steps.review.outputs.result }}"
-
-          echo "Posting comment to PR..."
-
-          curl -X POST \
+          curl -s -X POST \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n --arg body "$BODY" '{body:$body}')" \
+            -d "$(jq -n --arg body "${{ steps.review.outputs.result }}" '{body:$body}')" \
             https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr }}/comments
