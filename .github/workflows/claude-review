@@ -1,0 +1,77 @@
+name: Claude PR Review
+
+on:
+issue_comment:
+types: [created]
+
+permissions:
+contents: read
+pull-requests: write
+issues: write
+
+jobs:
+review:
+if: >
+github.event.issue.pull_request &&
+contains(github.event.comment.body, '/review')
+
+```
+runs-on: ubuntu-latest
+
+steps:
+
+  - name: Extract PR number
+    id: pr
+    run: |
+      PR=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
+      echo "pr=$PR" >> $GITHUB_OUTPUT
+
+  - name: Fetch PR files
+    run: |
+      curl -s \
+      -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+      https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr }}/files \
+      > files.json
+
+  - name: Review each file with Claude
+    run: |
+
+      FILE_COUNT=$(jq length files.json)
+
+      for ((i=0;i<FILE_COUNT;i++)); do
+
+        FILE=$(jq -r ".[$i].filename" files.json)
+        PATCH=$(jq -r ".[$i].patch // empty" files.json)
+
+        if [ -z "$PATCH" ]; then
+          continue
+        fi
+
+        echo "Reviewing $FILE"
+
+        RESPONSE=$(curl https://api.anthropic.com/v1/messages \
+          -s \
+          -H "x-api-key: ${{ secrets.CLAUDE_API_KEY }}" \
+          -H "anthropic-version: 2023-06-01" \
+          -H "content-type: application/json" \
+          -d "$(jq -n \
+            --arg file "$FILE" \
+            --arg patch "$PATCH" \
+            '{
+              model: "claude-3-7-sonnet-latest",
+              max_tokens: 1200,
+              system: "You are a senior staff engineer reviewing pull requests.",
+              messages: [
+                {
+                  role: "user",
+                  content: "Review this git patch for file \($file).\n\nReturn JSON in this format:\n{\n  \"comments\": [\n    {\"line\": number, \"comment\": \"text\"}\n  ]\n}\n\nPatch:\n\($patch)"
+                }
+              ]
+            }')")
+
+        echo "$RESPONSE" > review.json
+
+        jq -c '.content[0].text' review.json > parsed.txt || continue
+
+      done
+```
