@@ -24,6 +24,17 @@ jobs:
           echo "PR number: $PR"
           echo "pr=$PR" >> $GITHUB_OUTPUT
 
+      - name: Get PR head SHA
+        id: sha
+        run: |
+          curl -s \
+          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+          https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr }} \
+          > pr.json
+
+          SHA=$(jq -r '.head.sha' pr.json)
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+
       - name: Fetch PR files
         run: |
           curl -s \
@@ -61,15 +72,14 @@ jobs:
                 "messages": [
                   {
                     "role": "user",
-                    "content": "You are a senior engineer reviewing a pull request. Identify bugs, edge cases, security issues, and improvements.\n\nReview this diff:\n\n\($patch)"
+                    "content": "You are a senior engineer reviewing a pull request.\n\nAnalyze the git diff and return JSON ONLY in this format:\n\n{\n \"comments\": [\n   {\n     \"file\": \"path/to/file\",\n     \"line\": number,\n     \"comment\": \"review comment\"\n   }\n ]\n}\n\nDiff:\n\n\($patch)"
                   }
                 ]
               }')")
 
           echo "Claude API raw response:"
-          echo "$RESPONSE"
-
-          RESULT=$(echo "$RESPONSE" | jq -r '.content[0].text')
+          echo "$RESPONSE" > claude_raw.json
+          echo "$RESPONSE" | jq -r '.content[0].text' > review.json
 
           if [ -z "$RESULT" ]; then
             RESULT="⚠️ Claude returned no review. Check workflow logs for API response."
@@ -79,10 +89,37 @@ jobs:
           echo "$RESULT" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Post PR comment
+      - name: Post inline comments
         run: |
-          curl -s -X POST \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n --arg body "${{ steps.review.outputs.result }}" '{body:$body}')" \
-            https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr }}/comments
+
+          COMMENTS=$(jq '.comments | length' review.json)
+
+          if [ "$COMMENTS" = "null" ]; then
+            echo "No comments returned"
+            exit 0
+          fi
+
+          for ((i=0;i<COMMENTS;i++)); do
+
+            FILE=$(jq -r ".comments[$i].file" review.json)
+            LINE=$(jq -r ".comments[$i].line" review.json)
+            TEXT=$(jq -r ".comments[$i].comment" review.json)
+
+            echo "Posting comment on $FILE:$LINE"
+
+            curl -s -X POST \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr }}/comments \
+              -d "$(jq -n \
+                --arg body "$TEXT" \
+                --arg path "$FILE" \
+                --argjson line "$LINE" \
+                --arg commit "${{ steps.sha.outputs.sha }}" \
+                '{
+                  body:$body,
+                  path:$path,
+                  line:$line,
+                  side:"RIGHT",
+                  commit_id:$commit
+                }')"
