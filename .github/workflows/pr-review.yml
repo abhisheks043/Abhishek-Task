@@ -1,84 +1,55 @@
-name: AI PR Review
+- name: Ask OpenAI
+  id: ai
+  run: |
 
-on:
-  issue_comment:
-    types: [created]
+    PATCH=$(cat patch.txt | head -c 8000)
 
-permissions:
-  contents: read
-  issues: write
-  pull-requests: read
+    RESPONSE=$(curl https://api.openai.com/v1/chat/completions \
+      -s \
+      -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
+      -H "Content-Type: application/json" \
+      -d "$(jq -n \
+        --arg patch "$PATCH" \
+        '{
+          model: "gpt-4o-mini",
+          messages: [
+            {
+              role:"system",
+              content:"You are a senior engineer performing strict pull request reviews."
+            },
+            {
+              role:"user",
+              content:"Review this git diff and suggest improvements grouped by file.\n\n\($patch)"
+            }
+          ]
+        }')")
 
-jobs:
-  review:
-    if: >
-      github.event.issue.pull_request &&
-      contains(github.event.comment.body, '@review')
+    echo "OPENAI RESPONSE:"
+    echo "$RESPONSE"
 
-    runs-on: ubuntu-latest
+    ERROR=$(echo "$RESPONSE" | jq -r '.error.message // empty')
+    TYPE=$(echo "$RESPONSE" | jq -r '.error.code // empty')
 
-    steps:
-      - name: Extract PR number
-        id: pr
-        run: |
-          PR=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
-          echo "PR number: $PR"
-          echo "pr=$PR" >> $GITHUB_OUTPUT
+    if [ ! -z "$ERROR" ]; then
 
-      - name: Fetch PR files
-        run: |
-          curl -s \
-          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-          https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr }}/files \
-          > files.json
+      if [ "$TYPE" = "insufficient_quota" ]; then
+        REVIEW="⚠️ AI review unavailable: OpenAI quota exceeded. Please check billing."
 
-          echo "FILES:"
-          cat files.json
+      elif [ "$TYPE" = "invalid_api_key" ]; then
+        REVIEW="⚠️ Invalid OpenAI API key configured."
 
-      - name: Build patch summary
-        run: |
-          jq -r '.[] | "\(.filename)\n\(.patch)\n---"' files.json > patch.txt
-          echo "PATCH:"
-          cat patch.txt
+      else
+        REVIEW="⚠️ OpenAI API error: $ERROR"
+      fi
 
-      - name: Ask OpenAI
-        id: ai
-        run: |
+    else
+      REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
 
-          PATCH=$(cat patch.txt | head -c 8000)
+      if [ -z "$REVIEW" ]; then
+        REVIEW="⚠️ AI returned empty review."
+      fi
+    fi
 
-          RESPONSE=$(curl https://api.openai.com/v1/chat/completions \
-            -s \
-            -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n \
-              --arg patch "$PATCH" \
-              '{
-                model: "gpt-4o-mini",
-                messages: [
-                  {role:"system",content:"You are a strict code reviewer."},
-                  {role:"user",content:"Review this diff and give feedback:\n\n\($patch)"}
-                ]
-              }')")
-
-          echo "OPENAI RESPONSE:"
-          echo "$RESPONSE"
-
-          REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "AI returned empty response."')
-
-          echo "review<<EOF" >> $GITHUB_OUTPUT
-          echo "$REVIEW" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Post PR comment
-        run: |
-          BODY="${{ steps.ai.outputs.review }}"
-
-          echo "POSTING COMMENT:"
-          echo "$BODY"
-
-          curl -v -X POST \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n --arg body "$BODY" '{body:$body}')" \
-            https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr }}/comments
+    echo "review<<EOF" >> $GITHUB_OUTPUT
+    echo "$REVIEW" >> $GITHUB_OUTPUT
+    echo "EOF" >> $GITHUB_OUTPUT
