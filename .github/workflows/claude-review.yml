@@ -21,6 +21,7 @@ jobs:
         id: pr
         run: |
           PR=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
+          echo "PR number: $PR"
           echo "pr=$PR" >> $GITHUB_OUTPUT
 
       - name: Fetch PR files
@@ -30,14 +31,22 @@ jobs:
             https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr }}/files \
             > files.json
 
+          echo "Fetched PR files:"
+          cat files.json
+
       - name: Build patch summary
         run: |
-          jq -r '.[] | "\(.filename)\n\(.patch)\n---"' files.json > patch.txt
+          jq -r '.[] | select(.patch != null) | "\(.filename)\n\(.patch)\n---"' files.json > patch.txt
+
+          echo "Patch preview:"
+          head -n 50 patch.txt
 
       - name: Call Claude API
         id: review
         run: |
-          PATCH=$(head -c 15000 patch.txt)
+          PATCH=$(head -c 12000 patch.txt)
+
+          echo "Sending patch to Claude..."
 
           RESPONSE=$(curl https://api.anthropic.com/v1/messages \
             -s \
@@ -47,20 +56,23 @@ jobs:
             -d "$(jq -n \
               --arg patch "$PATCH" \
               '{
-                model: "claude-3-7-sonnet-latest",
+                model: "claude-3-5-sonnet-latest",
                 max_tokens: 1000,
                 messages: [
                   {
                     role: "user",
-                    content: "Review this pull request diff:\n\n\($patch)"
+                    content: "You are a senior engineer reviewing a pull request. Identify bugs, edge cases, security issues, and improvements.\n\nReview this diff:\n\n\($patch)"
                   }
                 ]
               }')")
 
+          echo "Claude API raw response:"
+          echo "$RESPONSE"
+
           RESULT=$(echo "$RESPONSE" | jq -r '.content[0].text // empty')
 
           if [ -z "$RESULT" ]; then
-            RESULT="Claude returned no review."
+            RESULT="⚠️ Claude returned no review. Check workflow logs for API response."
           fi
 
           echo "result<<EOF" >> $GITHUB_OUTPUT
@@ -70,6 +82,8 @@ jobs:
       - name: Post comment to PR
         run: |
           BODY="${{ steps.review.outputs.result }}"
+
+          echo "Posting comment to PR..."
 
           curl -X POST \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
