@@ -13,7 +13,7 @@ jobs:
   review:
     if: >
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, 'cursor review')
+      contains(github.event.comment.body, '@review')
 
     runs-on: ubuntu-latest
 
@@ -21,7 +21,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Get PR info
+      - name: Get PR number
         id: pr
         run: |
           PR_NUMBER=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
@@ -35,11 +35,14 @@ jobs:
           -H "Accept: application/vnd.github.v3.diff" \
           https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr_number }})
 
+          # Prevent huge prompts
+          DIFF=$(echo "$DIFF" | head -c 12000)
+
           echo "diff<<EOF" >> $GITHUB_OUTPUT
           echo "$DIFF" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Ask OpenAI for review
+      - name: Send diff to OpenAI
         id: ai
         run: |
           RESPONSE=$(curl https://api.openai.com/v1/chat/completions \
@@ -53,16 +56,23 @@ jobs:
             messages: [
               {
                 role: "system",
-                content: "You are a senior software engineer performing a PR review."
+                content: "You are a senior software engineer performing a professional pull request review."
               },
               {
                 role: "user",
-                content: "Review this pull request diff and provide clear actionable feedback:\n\n\($diff)"
+                content: "Review this pull request diff and provide concise actionable feedback. Focus on bugs, architecture, readability, and best practices.\n\n\($diff)"
               }
             ]
           }')")
 
-          REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content')
+          echo "OpenAI raw response:"
+          echo "$RESPONSE"
+
+          REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+
+          if [ -z "$REVIEW" ]; then
+            REVIEW="⚠️ AI review failed. Please check workflow logs."
+          fi
 
           echo "review<<EOF" >> $GITHUB_OUTPUT
           echo "$REVIEW" >> $GITHUB_OUTPUT
