@@ -1,4 +1,4 @@
-name: Debug AI PR Review
+name: AI PR Review
 
 on:
   issue_comment:
@@ -6,86 +6,78 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
   issues: write
+  pull-requests: read
 
 jobs:
   review:
     if: >
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, '@review')
+      contains(github.event.comment.body, '@review') &&
+      github.event.comment.user.type != 'Bot'
 
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Extract PR number
+      - name: Get PR number
         id: pr
         run: |
           PR=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
-          echo "PR=$PR"
           echo "pr=$PR" >> $GITHUB_OUTPUT
 
-      - name: Fetch PR files
+      - name: Fetch changed files
         run: |
           curl -s \
           -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
           https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr }}/files \
           > files.json
 
-          echo "FILES JSON:"
-          cat files.json
-
-      - name: Extract patches
+      - name: Build patch summary
         run: |
-          jq -c '.[] | {file: .filename, patch: .patch}' files.json > patches.json
-          echo "PATCHES:"
-          cat patches.json
+          jq -r '.[] | "\(.filename)\n\(.patch)\n---"' files.json | head -c 12000 > patch.txt
 
-      - name: Send to OpenAI
+      - name: Ask OpenAI for review
         id: ai
         run: |
 
-          PATCH=$(cat patches.json | head -c 10000)
-
-          echo "PATCH SENT TO AI:"
-          echo "$PATCH"
+          PATCH=$(cat patch.txt)
 
           RESPONSE=$(curl https://api.openai.com/v1/chat/completions \
-          -s \
-          -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
-          -H "Content-Type: application/json" \
-          -d "$(jq -n \
-            --arg patch "$PATCH" \
-            '{
-              model: "gpt-4o-mini",
-              messages: [
-                {role:"system",content:"You are a code reviewer."},
-                {role:"user",content:"Return JSON array: [{file,line,comment}] for issues.\n\n\($patch)"}
-              ]
-            }')")
+            -s \
+            -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg patch "$PATCH" \
+              '{
+                model: "gpt-4o-mini",
+                messages: [
+                  {
+                    role: "system",
+                    content: "You are a senior software engineer performing code reviews."
+                  },
+                  {
+                    role: "user",
+                    content: "Review the following git diff. Provide concise improvement suggestions grouped by file. Always return useful feedback even if the code is correct.\n\n\($patch)"
+                  }
+                ]
+              }')")
 
-          echo "OPENAI RESPONSE:"
           echo "$RESPONSE"
 
-          CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "[]"')
+          REVIEW=$(echo "$RESPONSE" | jq -r '.choices[0].message.content')
 
-          echo "$CONTENT" > comments.json
+          if [ -z "$REVIEW" ] || [ "$REVIEW" = "null" ]; then
+            REVIEW="AI review failed. Check workflow logs."
+          fi
 
-          echo "AI COMMENTS:"
-          cat comments.json
+          echo "review<<EOF" >> $GITHUB_OUTPUT
+          echo "$REVIEW" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Post fallback PR comment
+      - name: Post PR comment
         run: |
-
-          BODY=$(cat comments.json)
-
-          echo "Posting comment to PR..."
-
-          curl -v \
-          -X POST \
-          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-          -H "Content-Type: application/json" \
-          -d "$(jq -n --arg body "$BODY" '{body:$body}')" \
-          https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr }}/comments
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg body "${{ steps.ai.outputs.review }}" '{body:$body}')" \
+            https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr }}/comments
