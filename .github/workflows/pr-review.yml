@@ -1,4 +1,4 @@
-name: Production AI PR Review
+name: Debug AI PR Review
 
 on:
   issue_comment:
@@ -13,100 +13,79 @@ jobs:
   review:
     if: >
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, '@review') &&
-      github.event.comment.user.type != 'Bot'
+      contains(github.event.comment.body, '@review')
 
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Get PR number
+      - name: Extract PR number
         id: pr
         run: |
-          PR_NUMBER=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
-          echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          PR=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
+          echo "PR=$PR"
+          echo "pr=$PR" >> $GITHUB_OUTPUT
 
       - name: Fetch PR files
         run: |
           curl -s \
           -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-          https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr_number }}/files \
+          https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr }}/files \
           > files.json
 
-          echo "Changed files:"
-          jq '.[].filename' files.json
+          echo "FILES JSON:"
+          cat files.json
 
-      - name: Prepare minimal patch summary
+      - name: Extract patches
         run: |
-          jq -c '.[] | {file: .filename, patch: .patch}' files.json \
-          | head -n 20 > patches.json
-
-          echo "Patch preview:"
+          jq -c '.[] | {file: .filename, patch: .patch}' files.json > patches.json
+          echo "PATCHES:"
           cat patches.json
 
-      - name: Ask OpenAI for review
+      - name: Send to OpenAI
         id: ai
         run: |
 
-          PATCH=$(cat patches.json | head -c 12000)
+          PATCH=$(cat patches.json | head -c 10000)
+
+          echo "PATCH SENT TO AI:"
+          echo "$PATCH"
 
           RESPONSE=$(curl https://api.openai.com/v1/chat/completions \
-            -s \
-            -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n \
-              --arg patch "$PATCH" \
-              '{
-                model: "gpt-4o-mini",
-                messages: [
-                  {
-                    role: "system",
-                    content: "You are a senior software engineer reviewing pull requests."
-                  },
-                  {
-                    role: "user",
-                    content: "Analyze these git patches and return JSON array with fields: file, line, comment.\n\n\($patch)"
-                  }
-                ]
-              }')")
+          -s \
+          -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n \
+            --arg patch "$PATCH" \
+            '{
+              model: "gpt-4o-mini",
+              messages: [
+                {role:"system",content:"You are a code reviewer."},
+                {role:"user",content:"Return JSON array: [{file,line,comment}] for issues.\n\n\($patch)"}
+              ]
+            }')")
 
-          echo "OpenAI raw response:"
+          echo "OPENAI RESPONSE:"
           echo "$RESPONSE"
 
-          COMMENTS=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "[]"')
+          CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "[]"')
 
-          echo "$COMMENTS" > comments.json
+          echo "$CONTENT" > comments.json
 
-      - name: Post inline comments
+          echo "AI COMMENTS:"
+          cat comments.json
+
+      - name: Post fallback PR comment
         run: |
 
-          if [ ! -s comments.json ]; then
-            echo "No comments generated"
-            exit 0
-          fi
+          BODY=$(cat comments.json)
 
-          jq -c '.[]' comments.json | while read comment; do
+          echo "Posting comment to PR..."
 
-            FILE=$(echo "$comment" | jq -r '.file')
-            LINE=$(echo "$comment" | jq -r '.line')
-            BODY=$(echo "$comment" | jq -r '.comment')
-
-            echo "Posting comment on $FILE:$LINE"
-
-            curl -s -X POST \
-              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
-              -H "Content-Type: application/json" \
-              -d "$(jq -n \
-                --arg body "$BODY" \
-                --arg path "$FILE" \
-                --argjson line "$LINE" \
-                '{
-                  body: $body,
-                  path: $path,
-                  line: $line,
-                  side: "RIGHT"
-                }')" \
-              https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.pr.outputs.pr_number }}/comments
-
-          done
+          curl -v \
+          -X POST \
+          -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          -d "$(jq -n --arg body "$BODY" '{body:$body}')" \
+          https://api.github.com/repos/${{ github.repository }}/issues/${{ steps.pr.outputs.pr }}/comments
