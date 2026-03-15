@@ -1,4 +1,4 @@
-name: AI PR Review
+name: Production AI PR Review
 
 on:
   issue_comment:
@@ -13,15 +13,15 @@ jobs:
   review:
     if: >
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, '@review')
+      contains(github.event.comment.body, '@review') &&
+      github.event.comment.user.type != 'Bot'
 
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Extract PR info
+      - name: Get PR number
         id: pr
         run: |
           PR_NUMBER=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
@@ -35,65 +35,64 @@ jobs:
           > files.json
 
           echo "Changed files:"
-          cat files.json | jq '.[].filename'
+          jq '.[].filename' files.json
 
-      - name: Prepare patches
+      - name: Prepare minimal patch summary
         run: |
-          jq -c '.[] | {file: .filename, patch: .patch}' files.json > patches.json
+          jq -c '.[] | {file: .filename, patch: .patch}' files.json \
+          | head -n 20 > patches.json
 
-      - name: Call OpenAI reviewer
+          echo "Patch preview:"
+          cat patches.json
+
+      - name: Ask OpenAI for review
         id: ai
         run: |
 
           PATCH=$(cat patches.json | head -c 12000)
 
           RESPONSE=$(curl https://api.openai.com/v1/chat/completions \
-          -s \
-          -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
-          -H "Content-Type: application/json" \
-          -d "$(jq -n \
-            --arg patch "$PATCH" \
-            '{
-              model: "gpt-4o-mini",
-              messages: [
-                {
-                  role: "system",
-                  content: "You are a senior software engineer performing a pull request review."
-                },
-                {
-                  role: "user",
-                  content: "Analyze these git patches and return review comments in JSON format with fields: file, line, comment.\n\n\($patch)"
-                }
-              ]
-            }')")
+            -s \
+            -H "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n \
+              --arg patch "$PATCH" \
+              '{
+                model: "gpt-4o-mini",
+                messages: [
+                  {
+                    role: "system",
+                    content: "You are a senior software engineer reviewing pull requests."
+                  },
+                  {
+                    role: "user",
+                    content: "Analyze these git patches and return JSON array with fields: file, line, comment.\n\n\($patch)"
+                  }
+                ]
+              }')")
 
-          echo "OpenAI response:"
+          echo "OpenAI raw response:"
           echo "$RESPONSE"
 
-          COMMENTS=$(echo "$RESPONSE" | jq '.choices[0].message.content')
+          COMMENTS=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "[]"')
 
-          if [ "$COMMENTS" = "null" ]; then
-            echo "No comments generated."
-            echo "comments=[]" >> $GITHUB_OUTPUT
-          else
-            echo "comments=$COMMENTS" >> $GITHUB_OUTPUT
-          fi
+          echo "$COMMENTS" > comments.json
 
-      - name: Post inline review comments
+      - name: Post inline comments
         run: |
 
-          COMMENTS='${{ steps.ai.outputs.comments }}'
-
-          if [ "$COMMENTS" = "[]" ]; then
-            echo "No AI comments to post"
+          if [ ! -s comments.json ]; then
+            echo "No comments generated"
             exit 0
           fi
 
-          echo "$COMMENTS" | jq -c '.[]' | while read comment; do
+          jq -c '.[]' comments.json | while read comment; do
 
             FILE=$(echo "$comment" | jq -r '.file')
             LINE=$(echo "$comment" | jq -r '.line')
             BODY=$(echo "$comment" | jq -r '.comment')
+
+            echo "Posting comment on $FILE:$LINE"
 
             curl -s -X POST \
               -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
